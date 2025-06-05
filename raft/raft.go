@@ -17,6 +17,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"cs345/labgob"
 	"cs345/labrpc"
 	"math/rand"
 	"sync"
@@ -119,15 +121,13 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (4).
-
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
-	return
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -136,18 +136,20 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (4).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var voted int
+	var entries []LogEntry
+	if d.Decode(&term) != nil ||
+		d.Decode(&voted) != nil ||
+		d.Decode(&entries) != nil {
+		return
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = voted
+		rf.log = entries
+	}
 }
 
 // example RequestVote RPC arguments structure.
@@ -179,6 +181,13 @@ func (rf *Raft) lastLogTerm() int {
 	return rf.log[len(rf.log)-1].Term
 }
 
+func (rf *Raft) logTermAt(index int) int {
+	if index < 0 || index >= len(rf.log) {
+		return 0
+	}
+	return rf.log[index].Term
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3, 4).
@@ -197,16 +206,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
 
 	//decide if grant vote
 	upToDate := false
-	lastLogTerm := rf.lastLogTerm()
+	lastLogTerm := rf.logTermAt(rf.lastLogIndex())
 	lastLogindex := rf.lastLogIndex()
 
-	if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogindex) {
+	if args.LastLogTerm < 0 || args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogindex) {
 		upToDate = true
 	}
 
@@ -242,8 +252,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.state = Follower
+		rf.persist()
 	}
-	rf.state = Follower
+
 	reply.Term = rf.currentTerm
 
 	//reset election timer
@@ -258,20 +270,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// idx := args.PrevLogIndex + 1
-	// for i := 0; i < len(args.Entries); i++ {
-	// 	if idx+1 < len(rf.log) {
-	// 		if rf.log[idx+1].Term != args.Entries[i].Term {
-	// 			rf.log = rf.log[:idx+i]                      //delete everything after the mismatch
-	// 			rf.log = append(rf.log, args.Entries...)[i:] //add the leader version of it
-	// 			break
-	// 		}
-	// 	} else {
-	// 		rf.log = append(rf.log, args.Entries[i:]...) //add the rest if no mismatch
-	// 		break
-	// 	}
-	// }
-
 	// append any new entries
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
@@ -279,13 +277,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.log[idx].Term != entry.Term {
 				// conflict: delete the existing entry and all that follow it
 				rf.log = rf.log[:idx]
+				if rf.lastApplied >= idx {
+					rf.lastApplied = idx - 1
+				}
 				// append new entries
 				rf.log = append(rf.log, args.Entries[i:]...)
+				rf.persist()
 				break
 			}
 		} else {
 			// follower’s log is shorter: append remaining
 			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
 			break
 		}
 	}
@@ -365,6 +368,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := rf.lastLogIndex() + 1
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	rf.persist()
+
+	rf.matchIndex[rf.me] = index
+	rf.nextIndex[rf.me] = index + 1
+
 	term := rf.currentTerm
 
 	for i := range rf.peers {
@@ -428,6 +435,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	if rf.commitIndex > rf.lastLogIndex() {
+		rf.commitIndex = rf.lastLogIndex()
+	}
+
+	if rf.lastApplied > rf.lastLogIndex() {
+		rf.lastApplied = rf.lastLogIndex()
+	}
+
+	if len(rf.log) == 0 {
+		rf.log = make([]LogEntry, 1)
+	}
+
 	next := rf.lastLogIndex() + 1
 	for i := range rf.peers {
 		rf.nextIndex[i] = next
@@ -487,6 +506,7 @@ func (rf *Raft) startElection() {
 	rf.mu.Lock()
 	rf.state = Candidate
 	rf.currentTerm++
+	rf.votedFor = rf.me
 	rf.persist()
 	termStarted := rf.currentTerm
 	votes := 1
@@ -554,6 +574,20 @@ func (rf *Raft) startElection() {
 			for i := range rf.peers {
 				rf.nextIndex[i] = next
 				rf.matchIndex[i] = 0
+			}
+			for i := range rf.peers {
+				if i == rf.me {
+					continue
+				}
+				args := &AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PrevLogIndex: rf.lastLogIndex(),
+					PrevLogTerm:  rf.lastLogTerm(),
+					Entries:      nil,
+					LeaderCommit: rf.commitIndex,
+				}
+				go rf.leaderSendEntries(i, args)
 			}
 		}
 		//send emepty appending entries
