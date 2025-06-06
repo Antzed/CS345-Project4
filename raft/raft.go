@@ -22,6 +22,7 @@ import (
 	"cs345/labrpc"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -81,6 +82,8 @@ type Raft struct {
 	state                int
 	resetElectionTimerCh chan struct{}
 	heartbeatInterval    time.Duration
+
+	dead int32 // 0 ⇒ alive, 1 ⇒ rf.Kill() has been called
 }
 
 // AppendEntries RPC arguments structure.
@@ -118,28 +121,51 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.commitIndex) // NEW
+	e.Encode(rf.lastApplied) // NEW
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
+// func (rf *Raft) readPersist(data []byte) {
+// 	if data == nil || len(data) < 1 {
+// 		return
+// 	}
+// 	r := bytes.NewBuffer(data)
+// 	d := labgob.NewDecoder(r)
+// 	var term int
+// 	var voted int
+// 	var entries []LogEntry
+// 	if d.Decode(&term) != nil ||
+// 		d.Decode(&voted) != nil ||
+// 		d.Decode(&entries) != nil {
+// 		return
+// 	} else {
+// 		rf.currentTerm = term
+// 		rf.votedFor = voted
+// 		rf.log = entries
+// 	}
+// }
+
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 {
+	if data == nil || len(data) == 0 {
 		return
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var term int
-	var voted int
-	var entries []LogEntry
-	if d.Decode(&term) != nil ||
-		d.Decode(&voted) != nil ||
-		d.Decode(&entries) != nil {
+
+	if d.Decode(&rf.currentTerm) != nil ||
+		d.Decode(&rf.votedFor) != nil ||
+		d.Decode(&rf.log) != nil ||
+		d.Decode(&rf.commitIndex) != nil || // NEW
+		d.Decode(&rf.lastApplied) != nil { // NEW
+		// state was corrupt – start fresh
 		return
-	} else {
-		rf.currentTerm = term
-		rf.votedFor = voted
-		rf.log = entries
+	}
+	// keep internal invariants
+	if rf.lastApplied < rf.commitIndex {
+		rf.lastApplied = rf.commitIndex
 	}
 }
 
@@ -276,6 +302,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	if args.PrevLogIndex < rf.commitIndex {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictIndex = rf.commitIndex
+		return
+	}
+
 	// 5. Append any new entries not already in the log
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
@@ -302,6 +336,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 6. Update commitIndex if needed, then apply to state machine
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
+		rf.persist()
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
 			applyMsg := ApplyMsg{
@@ -371,7 +406,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 // Kill (not used here).
-func (rf *Raft) Kill() {}
+func (rf *Raft) Kill() {
+	atomic.StoreInt32(&rf.dead, 1) // mark dead
+	select {
+	case rf.resetElectionTimerCh <- struct{}{}:
+	default:
+	}
+}
+
+func (rf *Raft) killed() bool {
+	return atomic.LoadInt32(&rf.dead) == 1
+}
 
 // Make creates a new Raft server.
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -418,7 +463,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) ticker() {
-	for {
+	for !rf.killed() {
 		rf.mu.Lock()
 		state := rf.state
 		rf.mu.Unlock()
@@ -561,7 +606,7 @@ func (rf *Raft) startElection() {
 
 // leaderSendEntries now uses ConflictTerm/ConflictIndex on failure
 func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
-	for {
+	for !rf.killed() {
 		reply := &AppendEntriesReply{}
 		if !rf.sendAppendEntries(server, args, reply) {
 			// RPC failed (e.g., network), just return and retry from caller
@@ -602,6 +647,7 @@ func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
 				}
 				if cnt*2 > len(rf.peers) && rf.log[N].Term == rf.currentTerm {
 					rf.commitIndex = N
+					rf.persist()
 					for rf.lastApplied < rf.commitIndex {
 						rf.lastApplied++
 						applyMsg := ApplyMsg{
