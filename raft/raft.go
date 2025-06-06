@@ -121,32 +121,11 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	e.Encode(rf.commitIndex) // NEW
-	e.Encode(rf.lastApplied) // NEW
+	// e.Encode(rf.commitIndex) // NEW
+	// e.Encode(rf.lastApplied) // NEW
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
-
-// restore previously persisted state.
-// func (rf *Raft) readPersist(data []byte) {
-// 	if data == nil || len(data) < 1 {
-// 		return
-// 	}
-// 	r := bytes.NewBuffer(data)
-// 	d := labgob.NewDecoder(r)
-// 	var term int
-// 	var voted int
-// 	var entries []LogEntry
-// 	if d.Decode(&term) != nil ||
-// 		d.Decode(&voted) != nil ||
-// 		d.Decode(&entries) != nil {
-// 		return
-// 	} else {
-// 		rf.currentTerm = term
-// 		rf.votedFor = voted
-// 		rf.log = entries
-// 	}
-// }
 
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) == 0 {
@@ -157,9 +136,9 @@ func (rf *Raft) readPersist(data []byte) {
 
 	if d.Decode(&rf.currentTerm) != nil ||
 		d.Decode(&rf.votedFor) != nil ||
-		d.Decode(&rf.log) != nil ||
-		d.Decode(&rf.commitIndex) != nil || // NEW
-		d.Decode(&rf.lastApplied) != nil { // NEW
+		d.Decode(&rf.log) != nil { //||
+		// d.Decode(&rf.commitIndex) != nil || // NEW
+		// d.Decode(&rf.lastApplied) != nil { // NEW
 		// state was corrupt – start fresh
 		return
 	}
@@ -457,6 +436,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.nextIndex[i] = next
 		rf.matchIndex[i] = 0
 	}
+	rf.matchIndex[rf.me] = rf.lastLogIndex()
 
 	go rf.ticker()
 	return rf
@@ -580,6 +560,7 @@ func (rf *Raft) startElection() {
 				rf.nextIndex[i] = next
 				rf.matchIndex[i] = 0
 			}
+			rf.matchIndex[rf.me] = rf.lastLogIndex()
 			// send initial empty AppendEntries (heartbeats) to assert leadership
 			for i := range rf.peers {
 				if i == rf.me {
