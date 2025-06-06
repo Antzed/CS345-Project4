@@ -28,7 +28,7 @@ import (
 
 // Timing constants
 const (
-	raftElectionTimeout = 300 * time.Millisecond
+	raftElectionTimeout = 500 * time.Millisecond
 	HeartbeatInterval   = 100 * time.Millisecond
 )
 
@@ -121,8 +121,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	e.Encode(rf.commitIndex) // NEW
-	e.Encode(rf.lastApplied) // NEW
+	// e.Encode(rf.commitIndex) // NEW
+	// e.Encode(rf.lastApplied) // NEW
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -543,8 +543,10 @@ func (rf *Raft) startElection() {
 				muVotes.Lock()
 				defer muVotes.Unlock()
 				if reply.VoteGranted && termStarted == rf.currentTerm {
+					rf.mu.Lock()
 					votes++
 					cond.Broadcast()
+					rf.mu.Unlock()
 				} else if reply.Term > termStarted {
 					rf.mu.Lock()
 					rf.currentTerm = reply.Term
