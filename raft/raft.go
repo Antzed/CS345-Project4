@@ -121,8 +121,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	// e.Encode(rf.commitIndex) // NEW
-	// e.Encode(rf.lastApplied) // NEW
+	e.Encode(rf.commitIndex) // NEW
+	e.Encode(rf.lastApplied) // NEW
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
