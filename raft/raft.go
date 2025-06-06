@@ -27,7 +27,7 @@ import (
 
 // Timing constants
 const (
-	raftElectionTimeout = 300 * time.Millisecond
+	raftElectionTimeout = 800 * time.Millisecond
 	HeartbeatInterval   = 100 * time.Millisecond
 )
 
@@ -99,8 +99,20 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictTerm  int // new
+	ConflictIndex int // new
+}
+
+// helper for the leader’s quick jump-back
+func (rf *Raft) findLastIndexOfTerm(term int) int {
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if rf.log[i].Term == term {
+			return i
+		}
+	}
+	return -1
 }
 
 // return currentTerm and whether this server
@@ -126,12 +138,14 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.commitIndex)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
+
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -141,14 +155,19 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int
 	var voted int
 	var entries []LogEntry
+	var cidx int
+
 	if d.Decode(&term) != nil ||
 		d.Decode(&voted) != nil ||
-		d.Decode(&entries) != nil {
+		d.Decode(&entries) != nil ||
+		d.Decode(&cidx) != nil {
 		return
 	} else {
 		rf.currentTerm = term
 		rf.votedFor = voted
 		rf.log = entries
+		rf.commitIndex = cidx
+		rf.lastApplied = cidx
 	}
 }
 
@@ -207,6 +226,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = -1
 		rf.state = Follower
 		rf.persist()
+
+		select {
+		case rf.resetElectionTimerCh <- struct{}{}:
+		default:
+		}
 	}
 
 	reply.Term = rf.currentTerm
@@ -226,10 +250,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 
 		//reset election timer
-		select {
-		case rf.resetElectionTimerCh <- struct{}{}:
-		default:
-		}
+		// select {
+		// case rf.resetElectionTimerCh <- struct{}{}:
+		// default:
+		// }
 
 	} else {
 		reply.VoteGranted = false
@@ -256,6 +280,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.persist()
 	}
 
+	if args.PrevLogIndex < rf.commitIndex {
+		reply.Success = false
+		reply.ConflictTerm = -1 // -1 = tried to overwrite committed entry
+		reply.ConflictIndex = rf.commitIndex + 1
+		return
+	}
+
 	reply.Term = rf.currentTerm
 
 	//reset election timer
@@ -264,9 +295,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	default:
 	}
 
-	if args.PrevLogIndex >= len(rf.log) ||
-		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		reply.ConflictTerm = 0
+		reply.ConflictIndex = len(rf.log)
+		return
+	}
+	// ② term mismatch
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		// first index of that conflicting term
+		idx := args.PrevLogIndex
+		for idx > 0 && rf.log[idx-1].Term == reply.ConflictTerm {
+			idx--
+		}
+		reply.ConflictIndex = idx
 		return
 	}
 
@@ -277,9 +321,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.log[idx].Term != entry.Term {
 				// conflict: delete the existing entry and all that follow it
 				rf.log = rf.log[:idx]
+				if rf.commitIndex >= idx {
+					rf.commitIndex = idx - 1
+				}
 				if rf.lastApplied >= idx {
 					rf.lastApplied = idx - 1
 				}
+
 				// append new entries
 				rf.log = append(rf.log, args.Entries[i:]...)
 				rf.persist()
@@ -480,8 +528,8 @@ func (rf *Raft) ticker() {
 				args := &AppendEntriesArgs{
 					Term:         rf.currentTerm,
 					LeaderId:     rf.me,
-					PrevLogIndex: rf.lastLogIndex(),
-					PrevLogTerm:  rf.lastLogTerm(),
+					PrevLogIndex: rf.nextIndex[i] - 1,
+					PrevLogTerm:  rf.log[rf.nextIndex[i]-1].Term,
 					Entries:      nil,
 					LeaderCommit: rf.commitIndex,
 				}
@@ -501,33 +549,139 @@ func (rf *Raft) randomElectionTimeout() time.Duration {
 	return raftElectionTimeout + time.Duration(rand.Int63n(int64(raftElectionTimeout)))
 }
 
+// func (rf *Raft) startElection() {
+// 	// impelment this
+// 	rf.mu.Lock()
+// 	rf.state = Candidate
+// 	rf.currentTerm++
+// 	rf.votedFor = rf.me
+// 	rf.persist()
+// 	termStarted := rf.currentTerm
+// 	votes := 1
+// 	nPeers := len(rf.peers)
+// 	lastIndex := rf.lastLogIndex()
+// 	lastTerm := rf.lastLogTerm()
+// 	rf.mu.Unlock()
+
+// 	//reset timer
+// 	select {
+// 	case rf.resetElectionTimerCh <- struct{}{}:
+// 	default:
+// 	}
+
+// 	var muVotes sync.Mutex
+// 	cond := sync.NewCond(&muVotes)
+// 	for i := range rf.peers {
+// 		if i == rf.me {
+// 			continue
+// 		}
+// 		go func(sever int) {
+// 			args := &RequestVoteArgs{
+// 				Term:         termStarted,
+// 				CandidateId:  rf.me,
+// 				LastLogIndex: lastIndex,
+// 				LastLogTerm:  lastTerm,
+// 			}
+// 			reply := &RequestVoteReply{}
+// 			if rf.sendRequestVote(sever, args, reply) {
+// 				muVotes.Lock()
+// 				defer muVotes.Unlock()
+// 				// if request granted, great, if not, its a follower
+// 				if reply.VoteGranted && termStarted == rf.currentTerm {
+// 					votes++
+// 					cond.Broadcast()
+// 				} else if reply.Term > termStarted {
+// 					rf.mu.Lock()
+// 					rf.currentTerm = reply.Term
+// 					rf.state = Follower
+// 					rf.votedFor = -1
+// 					rf.persist()
+// 					select {
+// 					case rf.resetElectionTimerCh <- struct{}{}:
+// 					default:
+// 					}
+// 					rf.mu.Unlock()
+// 				}
+// 			}
+// 		}(i)
+// 	}
+
+// 	//wait for majoirty or lapse
+// 	muVotes.Lock()
+// 	for votes*2 <= nPeers {
+// 		rf.mu.Lock()
+// 		if rf.currentTerm != termStarted || rf.state != Candidate {
+// 			rf.mu.Unlock()
+// 			break
+// 		}
+// 		rf.mu.Unlock()
+// 		cond.Wait()
+// 	}
+
+// 	if votes*2 > nPeers {
+// 		rf.mu.Lock()
+// 		if rf.currentTerm == termStarted && rf.state == Candidate {
+// 			rf.state = Leader
+// 			next := rf.lastLogIndex() + 1
+// 			for i := range rf.peers {
+// 				rf.nextIndex[i] = next
+// 				rf.matchIndex[i] = 0
+// 			}
+// 			for i := range rf.peers {
+// 				if i == rf.me {
+// 					continue
+// 				}
+// 				args := &AppendEntriesArgs{
+// 					Term:         rf.currentTerm,
+// 					LeaderId:     rf.me,
+// 					PrevLogIndex: rf.lastLogIndex(),
+// 					PrevLogTerm:  rf.lastLogTerm(),
+// 					Entries:      nil,
+// 					LeaderCommit: rf.commitIndex,
+// 				}
+// 				go rf.leaderSendEntries(i, args)
+// 			}
+// 		}
+// 		//send emepty appending entries
+// 		select {
+// 		case rf.resetElectionTimerCh <- struct{}{}:
+// 		default:
+// 		}
+// 		rf.mu.Unlock()
+// 	}
+// 	muVotes.Unlock()
+
+// }
+
 func (rf *Raft) startElection() {
-	// impelment this
+	// ── STEP 0: Become Candidate ──
 	rf.mu.Lock()
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
 	rf.persist()
 	termStarted := rf.currentTerm
-	votes := 1
+	votes := 1 // we vote for ourselves
 	nPeers := len(rf.peers)
 	lastIndex := rf.lastLogIndex()
 	lastTerm := rf.lastLogTerm()
 	rf.mu.Unlock()
 
-	//reset timer
+	// ── STEP 1: Reset our own election timer immediately ──
 	select {
 	case rf.resetElectionTimerCh <- struct{}{}:
 	default:
 	}
 
-	var muVotes sync.Mutex
-	cond := sync.NewCond(&muVotes)
+	// ── STEP 2: Prepare a channel to notify when “vote tally” changes or we step down ──
+	voteCh := make(chan struct{}, 1)
+
+	// Launch one goroutine per peer (excluding ourselves) to send RequestVote RPC
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		go func(sever int) {
+		go func(peer int) {
 			args := &RequestVoteArgs{
 				Term:         termStarted,
 				CandidateId:  rf.me,
@@ -535,70 +689,117 @@ func (rf *Raft) startElection() {
 				LastLogTerm:  lastTerm,
 			}
 			reply := &RequestVoteReply{}
-			if rf.sendRequestVote(sever, args, reply) {
-				muVotes.Lock()
-				defer muVotes.Unlock()
-				// if request granted, great, if not, its a follower
+			if rf.sendRequestVote(peer, args, reply) {
+				// CASE A: Vote granted AND we are still in the same term
+				rf.mu.Lock()
 				if reply.VoteGranted && termStarted == rf.currentTerm {
 					votes++
-					cond.Broadcast()
-				} else if reply.Term > termStarted {
-					rf.mu.Lock()
+					// Non-blocking notify: send into voteCh if nobody else is waiting
+					select {
+					case voteCh <- struct{}{}:
+					default:
+					}
+					rf.mu.Unlock()
+					return
+				}
+
+				// CASE B: They returned a higher term → we must step down immediately
+				if reply.Term > termStarted {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
 					rf.votedFor = -1
 					rf.persist()
+					// ── NEW: Reset our election timer since we stepped down ──
+					select {
+					case rf.resetElectionTimerCh <- struct{}{}:
+					default:
+					}
+					// Notify candidate to stop waiting
+					select {
+					case voteCh <- struct{}{}:
+					default:
+					}
 					rf.mu.Unlock()
+					return
 				}
+
+				// Otherwise, vote denied (either log not up to date or already voted).
+				// Do NOT send on voteCh here, because vote count didn’t increase.
+				rf.mu.Unlock()
 			}
 		}(i)
 	}
 
-	//wait for majoirty or lapse
-	muVotes.Lock()
-	for votes*2 <= nPeers {
+	// ── STEP 3: Wait either for majority, a higher‐term step-down, or timeout ──
+	electionTimer := time.After(rf.randomElectionTimeout())
+
+	for {
+		// First, check if someone forced us out of Candidate state
 		rf.mu.Lock()
 		if rf.currentTerm != termStarted || rf.state != Candidate {
 			rf.mu.Unlock()
-			break
+			return
 		}
-		rf.mu.Unlock()
-		cond.Wait()
-	}
 
-	if votes*2 > nPeers {
-		rf.mu.Lock()
-		if rf.currentTerm == termStarted || rf.state != Candidate {
+		// Check if we already have a majority
+		if votes*2 > nPeers {
+			// We have a majority; become Leader
 			rf.state = Leader
-			next := rf.lastLogIndex() + 1
-			for i := range rf.peers {
-				rf.nextIndex[i] = next
-				rf.matchIndex[i] = 0
+			nextIdx := rf.lastLogIndex() + 1
+			for j := range rf.peers {
+				rf.nextIndex[j] = nextIdx
+				rf.matchIndex[j] = 0
 			}
-			for i := range rf.peers {
-				if i == rf.me {
-					continue
-				}
-				args := &AppendEntriesArgs{
-					Term:         rf.currentTerm,
-					LeaderId:     rf.me,
-					PrevLogIndex: rf.lastLogIndex(),
-					PrevLogTerm:  rf.lastLogTerm(),
-					Entries:      nil,
-					LeaderCommit: rf.commitIndex,
-				}
-				go rf.leaderSendEntries(i, args)
+			// Immediately send a heartbeat (empty AppendEntries) to everyone
+			// for j := range rf.peers {
+			// 	if j == rf.me {
+			// 		continue
+			// 	}
+			// 	args := &AppendEntriesArgs{
+			// 		Term:         rf.currentTerm,
+			// 		LeaderId:     rf.me,
+			// 		PrevLogIndex: rf.lastLogIndex(),
+			// 		PrevLogTerm:  rf.lastLogTerm(),
+			// 		Entries:      nil,
+			// 		LeaderCommit: rf.commitIndex,
+			// 	}
+			// 	go rf.leaderSendEntries(j, args)
+			// }
+			// Reset our election timer so we don’t immediately start another election
+			select {
+			case rf.resetElectionTimerCh <- struct{}{}:
+			default:
 			}
-		}
-		//send emepty appending entries
-		select {
-		case rf.resetElectionTimerCh <- struct{}{}:
-		default:
+			rf.mu.Unlock()
+			return
 		}
 		rf.mu.Unlock()
-	}
-	muVotes.Unlock()
 
+		// Otherwise, wait for either:
+		// (a) A “voteCh” signal (meaning either we gained a vote or a higher term arrived),
+		// (b) Our electionTimer timed out.
+		select {
+		case <-voteCh:
+			// We wake up—re‐loop to check (majority or forced step-down).
+			continue
+
+		case <-electionTimer:
+			// Election timed out (we failed to gather majority in time).
+			// Step down to Follower (if still Candidate in this term), reset timer, and return.
+			rf.mu.Lock()
+			if rf.state == Candidate && rf.currentTerm == termStarted {
+				rf.state = Follower
+				rf.votedFor = -1
+				rf.persist()
+				select {
+				case rf.resetElectionTimerCh <- struct{}{}:
+				default:
+				}
+			}
+			rf.mu.Unlock()
+			return
+		}
+	}
 }
 
 func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
@@ -616,6 +817,11 @@ func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
 			rf.state = Follower
 			rf.votedFor = -1
 			rf.persist()
+
+			select {
+			case rf.resetElectionTimerCh <- struct{}{}:
+			default:
+			}
 			rf.mu.Unlock()
 			return
 		}
@@ -654,8 +860,19 @@ func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
 			}
 			rf.mu.Unlock()
 			return
-		} else {
-			rf.nextIndex[server] = max(1, rf.nextIndex[server]-1)
+		} else { // reply.Success == false
+			if reply.ConflictTerm != 0 {
+				// try to find last index of ConflictTerm in our log
+				if idx := rf.findLastIndexOfTerm(reply.ConflictTerm); idx >= 0 {
+					rf.nextIndex[server] = idx + 1
+				} else {
+					rf.nextIndex[server] = reply.ConflictIndex
+				}
+			} else {
+				// follower was shorter than our prevLogIndex
+				rf.nextIndex[server] = reply.ConflictIndex
+			}
+			// rebuild AppendEntries with new prev index
 			prev := rf.nextIndex[server] - 1
 			args.Term = rf.currentTerm
 			args.PrevLogIndex = prev
