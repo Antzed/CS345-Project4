@@ -58,12 +58,12 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+	mu        sync.Mutex
+	peers     []*labrpc.ClientEnd
+	persister *Persister
+	me        int
 
-	applyCh chan ApplyMsg // Channel for the commit to the state machine
+	applyCh chan ApplyMsg
 
 	// Persistent state on all servers (Figure 2)
 	currentTerm int
@@ -86,7 +86,6 @@ type Raft struct {
 	dead int32 // 0 ⇒ alive, 1 ⇒ rf.Kill() has been called
 }
 
-// AppendEntries RPC arguments structure.
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
@@ -96,7 +95,6 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
-// AppendEntriesReply now includes ConflictTerm and ConflictIndex
 type AppendEntriesReply struct {
 	Term          int
 	Success       bool
@@ -137,7 +135,7 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&rf.log) != nil {
 		return
 	}
-	// keep internal invariants
+
 	if rf.lastApplied < rf.commitIndex {
 		rf.lastApplied = rf.commitIndex
 	}
@@ -223,7 +221,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 1. Reply false if term < currentTerm
+	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -232,7 +230,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// 2. If term > currentTerm, update term & convert to follower
+	// If term > currentTerm, update term & convert to follower
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
@@ -242,13 +240,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 
-	// reset election timer
 	select {
 	case rf.resetElectionTimerCh <- struct{}{}:
 	default:
 	}
 
-	// 3. Check if PrevLogIndex is out of bounds
+	// Check if PrevLogIndex is out of bounds
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
 		reply.ConflictTerm = 0
@@ -256,10 +253,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// 4. Check if term at PrevLogIndex matches
+	// Check if term at PrevLogIndex matches
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		conflictTerm := rf.log[args.PrevLogIndex].Term
-		// find first index of this conflictTerm in log
 		firstIndex := 0
 		for i := args.PrevLogIndex; i >= 0; i-- {
 			if rf.log[i].Term != conflictTerm {
@@ -284,30 +280,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// 5. Append any new entries not already in the log
+	// Append any new entries to log
 	for i, entry := range args.Entries {
 		idx := args.PrevLogIndex + 1 + i
 		if idx < len(rf.log) {
 			if rf.log[idx].Term != entry.Term {
-				// conflict: delete the existing entry and everything after
+				//delete the existing entry and everything after if conflict
 				rf.log = rf.log[:idx]
 				if rf.lastApplied >= idx {
 					rf.lastApplied = idx - 1
 				}
-				// append the new entries
 				rf.log = append(rf.log, args.Entries[i:]...)
 				rf.persist()
 				break
 			}
 		} else {
-			// follower's log is shorter: append remaining entries
 			rf.log = append(rf.log, args.Entries[i:]...)
 			rf.persist()
 			break
 		}
 	}
 
-	// 6. Update commitIndex if needed, then apply to state machine
+	// Update commitIndex if needed
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
 		rf.persist()
@@ -327,13 +321,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.ConflictIndex = 0
 }
 
-// sendRequestVote helper
+// helpers
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
-// sendAppendEntries helper
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
@@ -376,7 +369,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, true
 }
 
-// Kill (not used here).
+// Kill.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1) // mark dead
 	select {
@@ -475,7 +468,6 @@ func init() {
 }
 
 func (rf *Raft) randomElectionTimeout() time.Duration {
-	// return raftElectionTimeout + time.Duration(rand.Int63n(int64(raftElectionTimeout)))
 
 	base := raftElectionTimeout
 	jitter := base / 2
@@ -588,7 +580,7 @@ func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
 	for !rf.killed() {
 		reply := &AppendEntriesReply{}
 		if !rf.sendAppendEntries(server, args, reply) {
-			// RPC failed (e.g., network), just return and retry from caller
+			// RPC failed, so retry
 			return
 		}
 
@@ -604,14 +596,12 @@ func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
 			return
 		}
 
-		// If not still leader or terms don't match anymore, stop
 		if rf.state != Leader || args.Term != rf.currentTerm {
 			rf.mu.Unlock()
 			return
 		}
 
 		if reply.Success {
-			// Advance matchIndex and nextIndex for this follower
 			n := args.PrevLogIndex + len(args.Entries)
 			rf.matchIndex[server] = n
 			rf.nextIndex[server] = n + 1
@@ -657,13 +647,11 @@ func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
 					rf.nextIndex[server] = reply.ConflictIndex
 				}
 			} else {
-				// No specific term, so follower’s log is shorter
 				rf.nextIndex[server] = reply.ConflictIndex
 			}
 
 			// Rebuild new args based on updated nextIndex[server]
 			nextIdx := rf.nextIndex[server]
-			// If nextIdx <= 0, clamp to 1 (we always keep log[0] as a dummy)
 			if nextIdx < 1 {
 				nextIdx = 1
 			}
