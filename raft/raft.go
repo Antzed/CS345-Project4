@@ -28,7 +28,7 @@ import (
 
 // Timing constants
 const (
-	raftElectionTimeout = 500 * time.Millisecond
+	raftElectionTimeout = 800 * time.Millisecond
 	HeartbeatInterval   = 100 * time.Millisecond
 )
 
@@ -121,8 +121,6 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	// e.Encode(rf.commitIndex) // NEW
-	// e.Encode(rf.lastApplied) // NEW
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -136,10 +134,7 @@ func (rf *Raft) readPersist(data []byte) {
 
 	if d.Decode(&rf.currentTerm) != nil ||
 		d.Decode(&rf.votedFor) != nil ||
-		d.Decode(&rf.log) != nil { //||
-		// d.Decode(&rf.commitIndex) != nil || // NEW
-		// d.Decode(&rf.lastApplied) != nil { // NEW
-		// state was corrupt – start fresh
+		d.Decode(&rf.log) != nil {
 		return
 	}
 	// keep internal invariants
@@ -323,10 +318,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				Command:      rf.log[rf.lastApplied].Command,
 				CommandIndex: rf.lastApplied,
 			}
-			// release lock while sending on applyCh
-			rf.mu.Unlock()
 			rf.applyCh <- applyMsg
-			rf.mu.Lock()
 		}
 	}
 
@@ -483,7 +475,11 @@ func init() {
 }
 
 func (rf *Raft) randomElectionTimeout() time.Duration {
-	return raftElectionTimeout + time.Duration(rand.Int63n(int64(raftElectionTimeout)))
+	// return raftElectionTimeout + time.Duration(rand.Int63n(int64(raftElectionTimeout)))
+
+	base := raftElectionTimeout
+	jitter := base / 2
+	return base + time.Duration(rand.Int63n(int64(jitter)))
 }
 
 func (rf *Raft) startElection() {
@@ -638,9 +634,7 @@ func (rf *Raft) leaderSendEntries(server int, args *AppendEntriesArgs) {
 							Command:      rf.log[rf.lastApplied].Command,
 							CommandIndex: rf.lastApplied,
 						}
-						rf.mu.Unlock()
 						rf.applyCh <- applyMsg
-						rf.mu.Lock()
 					}
 				}
 			}
